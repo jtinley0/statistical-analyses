@@ -1,0 +1,1099 @@
+---
+title: 'Hypertension Drug Market Analysis'
+author: "Jim Tinley"
+date: "2024-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(data.table)
+library(psych)
+library(dplyr)
+library(ggplot2)
+library(writexl)
+library(stringr)
+library(glmnet)
+```
+
+```{r}
+drug_df <- fread("prescription-table.csv")
+copy_drug_df <- fread("prescription-table.csv")
+
+patient_df <- fread("patient-demographics.csv")
+copy_patient_df <- fread("patient-demographics.csv")
+
+diag_df <- fread("diagnosis_table.csv")
+copy_diag_df <- fread("diagnosis_table.csv")
+
+ICD_mapping_df <- fread("icd9toicd10cmgem.csv")
+```
+
+## Data Wrangling
+
+### Reformatting column names
+
+#### changing columns names in diagnosis table
+```{r}
+
+setnames(diag_df, old = "Patient ID Number", new = "patient_id")
+setnames(diag_df, old = "Claim ID Number", new = "claim_id")
+setnames(diag_df, old = "Diagnosis Date", new = "diagnosis_date")
+setnames(diag_df, old = "Diagnosis ICD Code", new = "diagnosis_icd_code")
+setnames(diag_df, old = "Diagnosis ICD Description", new = "diagnosis_icd_desc")
+setnames(diag_df, old = "Physician ID Number", new = "physician_id")
+setnames(diag_df, old = "Physician Specialty", new = "physician_specialty")
+```
+
+#### changing columns names in drug table
+```{r}
+setnames(drug_df, old = "Claim ID Number", new = "claim_id")
+setnames(drug_df, old = "Patient ID Number", new = "patient_id")
+setnames(drug_df, old = "Physician ID Number", new = "physician_id")
+setnames(drug_df, old = "Physician Specialty", new = "physician_specialty")
+setnames(drug_df, old = "Patient Paid Amount", new = "patient_paid_amount")
+setnames(drug_df, old = "Prescription Quantity", new = "prescription_quantity")
+setnames(drug_df, old = "Prescription Days Supply", new = "prescription_days_supply")
+setnames(drug_df, old = "Prescription Filled Date", new = "prescription_filled_date")
+setnames(drug_df, old = "Drug Brand Name", new = "drug_brand_name")
+setnames(drug_df, old = "Drug Generic Name", new = "drug_generic_name")
+```
+
+#### Changing columns names in patient table
+```{r}
+setnames(patient_df, old = "Patient ID Number", new = "patient_id")
+setnames(patient_df, old = "Patient Age", new = "patient_age")
+setnames(patient_df, old = "Patient Gender", new = "patient_gender")
+```
+
+### Checking Data types
+```{r}
+sapply(diag_df, class)
+```
+```{r}
+sapply(patient_df, class)
+```
+
+```{r}
+sapply(drug_df, class)
+```
+#### Updating dates to date class in diag_df and drug_df
+```{r}
+drug_df$prescription_filled_date <- as.Date(drug_df$prescription_filled_date, format = "%m/%d/%y")
+diag_df$diagnosis_date <- as.Date(diag_df$diagnosis_date, format = "%m/%d/%y")
+```
+
+#### Updating physician_id to integer64 class in drug_df
+```{r}
+library(bit64)
+drug_df$physician_id <- as.integer64(drug_df$physician_id)
+```
+
+### Duplicate check
+
+#### Checking for duplicates in all tables
+```{r}
+count(unique(diag_df))
+count(unique(drug_df))
+count(unique(patient_df))
+```
+
+#### Checking duplicate claims in diag_df
+```{r}
+diag_claim_duplicates <- duplicated(diag_df$claim_id) | duplicated(diag_df$claim_id, fromLast = TRUE)
+diag_claim_duplicates_df <- diag_df[diag_claim_duplicates]
+
+# keeping claim duplicates; they correspond to multiple diagnoses same claim
+rm(diag_claim_duplicates_df, diag_claim_duplicates)
+```
+
+
+### Creating a new physician class column (broader more HT relevant specialty classes)
+#### in diag_df 
+```{r}
+diag_df <- diag_df[, physician_class := 
+                     ifelse(physician_specialty %in% c("FAMILY PRACTICE", "FAMILY MEDICINE",
+                                                       "FAMILY PRACTICE, SPORTS MEDICINE",
+                                                       "FAMILY PRACTICE, GERIATRIC MEDICINE",
+                                                       "GENERAL MEDICINE", "GENERAL PRACTICE"), "Family Medicine",
+                      ifelse(physician_specialty %in% c("INTERNAL MEDICINE", "INTERNAL MED, CARD. ELECTROPHYSIOLOGY",
+                                                       "INTERNAL MEDICINE, GERIATRICS", 
+                                                       "INTERNAL MEDICINE/EMERGENCY MEDICINE", 
+                                                       "INTERNAL MEDICINE/PEDIATRICS"), "Internal Medicine",
+                      ifelse(physician_specialty == "CARDIOVASCULAR DISEASES", "Cardiology",
+                      ifelse(physician_specialty == "NEPHROLOGY", "Nephrology",
+                      ifelse(physician_specialty %in% c("PHYSICIAN ASSISTANT", 
+                                                       "NURSE PRACTITIONER"), "Non-Physician Practitioners",
+                             "Other Physician Specialty")))))]
+```
+
+#### in drug_df (broader more relevant buckets)
+```{r}
+drug_df <- drug_df[, physician_class := 
+                     ifelse(physician_specialty %in% c("FAMILY PRACTICE", "FAMILY MEDICINE",
+                                                       "FAMILY PRACTICE, SPORTS MEDICINE",
+                                                       "FAMILY PRACTICE, GERIATRIC MEDICINE",
+                                                       "GENERAL MEDICINE", "GENERAL PRACTICE"), "Family Medicine",
+                      ifelse(physician_specialty %in% c("INTERNAL MEDICINE", "INTERNAL MED, CARD. ELECTROPHYSIOLOGY",
+                                                       "INTERNAL MEDICINE, GERIATRICS", 
+                                                       "INTERNAL MEDICINE/EMERGENCY MEDICINE", 
+                                                       "INTERNAL MEDICINE/PEDIATRICS"), "Internal Medicine",
+                      ifelse(physician_specialty == "CARDIOVASCULAR DISEASES", "Cardiology", "Other Physician Specialty")))]
+```
+
+
+### Converting Hypertension (HT) ICD9 codes to ICD10
+
+#### Removing decimal from diagnosis table ICD code column to match ICD crosswalk syntax
+```{r}
+diag_df$diagnosis_icd_code <- gsub("\\.", "", diag_df$diagnosis_icd_code)
+```
+
+#### Reformatting ICD9 codes in diag_df so they match ICD9 in crosswalk syntax
+```{r}
+diag_df <- diag_df[, diagnosis_icd_code := ifelse(
+                      diagnosis_icd_code %in% c(401, 4031, 4039, 416),
+                      paste0(diagnosis_icd_code, "0"),
+                      diagnosis_icd_code
+                    )]
+
+diag_df <- diag_df[, diagnosis_icd_code := ifelse(
+                      diagnosis_icd_code %in% c(403, 404),
+                      paste0(diagnosis_icd_code, "00"),
+                      diagnosis_icd_code
+                    )]
+```
+
+#### Making a temp copy of diag_df to join true ICD10 descriptions to final output later
+```{r}
+diag_df_temp <- diag_df
+```
+
+#### Joining ICD10 codes from ICD crosswalk
+```{r}
+setkey(diag_df, diagnosis_icd_code)
+setkey(ICD_mapping_df, icd9cm)
+
+diag_df <- diag_df[ICD_mapping_df, on = .(diagnosis_icd_code = icd9cm), icd10cm := i.icd10cm]
+```
+
+#### Replacing Hypertension ICD9 codes with ICD10 codes
+```{r}
+# I'm only translating hypertension ICD diag codes (9 to 10)--doing so for all diagnoses would be time consuming and is unnecessary for present analysis
+
+diag_df[, diagnosis_icd_code := ifelse(grepl("36|^40|^41|^57|^79|^99", 
+                                               diagnosis_icd_code) &
+                                           grepl("HYPERTEN", diagnosis_icd_desc),
+                                         icd10cm, diagnosis_icd_code)]
+```
+
+### Creating a data table with true ICD10 descriptions; used to join to original
+
+#### Creating a binary for all hypertensive diagnoses
+```{r}
+diag_df[, ht_binary := ifelse(grepl("HYPERTEN", diagnosis_icd_desc),1,0)]
+```
+
+#### Creating a new dataframe of all ht diagnoses
+```{r}
+ht_df <- diag_df[ht_binary==1,]
+```
+
+#### checking data to ensure all HT ICD9 codes have been converted to ICD10 equivalent
+```{r}
+ICD10_descriptions_df <- as.data.table(unique(ht_df$diagnosis_icd_code))
+setnames(ICD10_descriptions_df, old = "V1", new = "diagnosis_icd_code")
+```
+
+#### joining ICD10 descriptions to reference data table
+```{r}
+setkey(diag_df_temp, diagnosis_icd_code)
+ICD10_descriptions_df[diag_df_temp, on = .(diagnosis_icd_code), diagnosis_icd_desc := diagnosis_icd_desc]
+```
+
+#### Joining ICD10 HT descriptions
+```{r}
+diag_df <- diag_df[ICD10_descriptions_df, on = .(diagnosis_icd_code), icd10desc := i.diagnosis_icd_desc]
+```
+
+#### Changing ICD9 HT descriptions to ICD10 HT descriptions
+```{r}
+diag_df[, diagnosis_icd_desc := ifelse(!is.na(icd10desc) 
+                                       & diagnosis_icd_desc != icd10desc, 
+                                       icd10desc, 
+                                       diagnosis_icd_desc)]
+```
+
+#### Removing intermediate cols from diagnosis data frame and intermediate tables
+```{r}
+diag_df <- diag_df[, -c("icd10cm", "icd10desc")]
+rm(diag_df_temp, ICD_mapping_df, ICD10_descriptions_df)
+```
+
+#### Updating ht_binary
+```{r}
+ht_df <- diag_df[ht_binary==1,]
+```
+
+
+## Exploratory data analysis 
+
+### Claims diagnoses
+
+#### Checking the unique types of hypertension diagnoses (they should all be ICD10 descriptions)
+```{r}
+unique(ht_df$diagnosis_icd_desc)
+```
+
+#### Counting number of claims & patients by # of HT diagnosis. (all 200 unique patients have Essential/Primary HT)
+```{r}
+ht_claim_diagnoses <- ht_df[, .(unique_claims = uniqueN(claim_id)), by = .(diagnosis_icd_desc)][order(-unique_claims)]
+ht_patient_diagnoses <- ht_df[, .(unique_patients = uniqueN(patient_id)), by = .(diagnosis_icd_desc)][order(-unique_patients)]
+
+```
+
+#### plotting unique HT claims count
+```{r}
+library(stringr)
+
+top_diag_by_claim <- ht_claim_diagnoses[2:6, ][order(-unique_claims)]
+
+ggplot(top_diag_by_claim, aes(x = factor(diagnosis_icd_desc), y = unique_claims)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_text(aes(label = unique_claims), vjust = -0.5, hjust = 0.5, size = 5) +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        plot.margin = unit(c(1, 1, 2, 1), "lines")) +
+  labs(x = "Diagnosis Description", y = "Number of Unique Claims", title = "Top 5 Secondary Hypertension Diagnoses by Unique Claims",
+       size = 14) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 20))  # Wrap labels to multiple lines
+```
+#### exporting unique claims data to excel for Tableau plotting
+```{r}
+unique_HT_claim_file_path <- "~/Documents/Career/astellas-analysis/HT_diag_by_unique_claims.xlsx"
+write_xlsx(ht_claim_diagnoses, path = unique_HT_claim_file_path)
+```
+
+
+```{r}
+top_diag_by_patient <- ht_patient_diagnoses[2:6, ]
+top_diag_by_patient$diagnosis_icd_desc <- factor(top_diag_by_patient$diagnosis_icd_desc, 
+                                                 levels = top_diag_by_patient$diagnosis_icd_desc[order(-top_diag_by_patient$unique_patients)])
+
+ggplot(top_diag_by_patient, aes(x = diagnosis_icd_desc, y = unique_patients)) +
+  geom_bar(stat = "identity", fill = "red3", color = "black") +
+  geom_text(aes(label = unique_patients), vjust = -0.5, hjust = 0.5, size = 5) +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        plot.margin = unit(c(1, 1, 2, 1), "lines")) +
+  labs(x = "Diagnosis Description", y = "Number of Patients", title = "Top 5 Secondary Hypertension Diagnoses (# of Patients)",
+       size = 14) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 20))  # Wrap labels to multiple lines
+
+```
+
+#### exporting unique claims data to excel for Tableau plotting
+```{r}
+unique_HT_diag_patient_file_path <- "~/Documents/Career/astellas-analysis/HT_diag_patient_file_path.xlsx"
+write_xlsx(ht_patient_diagnoses, path = unique_HT_diag_patient_file_path)
+```
+
+
+
+#### removing intermediate data tables
+```{r}
+rm(top_diag_by_claim, top_diag_by_patient, ht_claim_diagnoses, ht_patient_diagnoses)
+```
+
+
+### Age Data Diagnoses
+
+#### Left joining ht_df with patient demographic data
+```{r}
+setkey(ht_df, patient_id)
+setkey(patient_df, patient_id)
+
+patient_diag_df <- ht_df[patient_df, on = .(patient_id)]
+```
+
+#### Plotting histogram of patients by age at first diagnosis
+```{r}
+ggplot(patient_diag_df, aes(x = patient_age)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+  labs(title = "Hypertension Patient Age",
+       x = "Age in Years",
+       y = "Frequency")
+```
+#### Chi-square to see if age different is significant (it's not)
+```{r}
+male_ages <- patient_diag_df[patient_diag_df$patient_gender == "M", "patient_age"]
+female_ages <- patient_diag_df[patient_diag_df$patient_gender == "F", "patient_age"]
+
+t_test_result <- t.test(male_ages, female_ages, na.rm = TRUE)
+print(t_test_result)
+```
+### Counting # patients by gender
+```{r}
+patient_df[, .N, by = "patient_gender"]
+```
+
+#### Age of patient diagnosed with HT by gender bins
+
+#### Probably going to exclude from presenation, mean age sufficient with chi-square sufficient
+#### Binning patients by age at first diagnosis
+```{r}
+patient_diag_df[, age_bin := cut(patient_age, breaks = c(0, 30, 40, 50, 110),
+                    labels = c("<30", "<40", "<50", "50+"), right = FALSE)]
+```
+
+```{r}
+ggplot(patient_diag_df, aes(x = age_bin, fill = patient_gender)) +
+  geom_bar(position = "dodge", color = "black") +
+  labs(title = "Age at First Hypertension Diagnosis",
+       x = "Age at First Hypertension Diagnosis",
+       y = "# of patients") +
+  scale_fill_manual(values = c("maroon", "skyblue"), name = "Patient Gender")
+```
+#### exporting age data for unique HT patients to excel for Tableau plotting (note using patient_df n=200; patient_diag_df has removals based on data with missing physician specialty n=191)
+```{r}
+age_HT_patient_file_path <- "~/Documents/Career/astellas-analysis/age_HT_patient_file_path.xlsx"
+write_xlsx(patient_df, path = age_HT_patient_file_path)
+```
+
+
+### Unique non-hypertension comorbid diagnoses data
+
+#### Creating a table that counts number of non-HT diagnoses
+```{r}
+non_ht_diagnoses_count <- diag_df[ht_binary == 0, .(non_ht_count = uniqueN(diagnosis_icd_code)), by = .(patient_id)]
+```
+
+#### Plotting histogram of unique counts non-HT comorbid diagnoses
+```{r}
+ggplot(non_ht_diagnoses_count, aes(x = non_ht_count)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+  labs(title = "Count of unique non-hypertension comorbid diagnoses",
+       x = "# Diagnoses",
+       y = "Frequency")
+```
+
+#### Creating a table of most commonly occuring, unique non-ht diagnoses across all patients
+```{r}
+#creating a table with non-ht conditions
+non_ht_conditions_df <- diag_df[ht_binary == 0]
+
+#removing duplicates with each patient
+non_ht_conditions_unique_df <- non_ht_conditions_df[, .(icd_diagnosis_desc = unique(diagnosis_icd_desc)), by = patient_id]
+
+#counting the unique non-hypertension diagnosis descriptions across all patients
+top_non_ht_conditions <- non_ht_conditions_unique_df[, .N, by = icd_diagnosis_desc]
+
+#selecting the top 5
+top_non_ht_conditions_df <- top_non_ht_conditions[order(-N)][1:10]
+```
+
+#### exporting comorbid counting data to excel for Tableau plotting 
+```{r}
+comorbid_conditions_file_path <- "~/Documents/Career/astellas-analysis/comorbid_conditions_file_path.xlsx"
+write_xlsx(top_non_ht_conditions, path = comorbid_conditions_file_path)
+```
+
+
+## Descriptive Stats
+
+### Treatment Rate - descriptively, how many patients in cohort are receiving treatment
+
+#### Full Joining drug data by with HT patient demographic data to get those who were or were not treated
+```{r}
+setkey(drug_df, patient_id)
+setkey(patient_df, patient_id)
+
+ht_drug_df <- merge(drug_df, patient_df, by = "patient_id", all = TRUE)
+```
+
+#### Counting # total patients by gender
+```{r}
+patient_df[, .N, by = "patient_gender"]
+```
+
+#### Counting # patients ever prescribed (in drug_df) by gender
+```{r}
+ht_drug_df[!is.na(claim_id), uniqueN(patient_id), by = "patient_gender"]
+```
+
+#### Calculating treatment rates
+```{r}
+overall_TR = (75+64)/200
+male_TR = (64/95)
+female_TR = (75/105)
+```
+
+#### creating treatment binary
+```{r}
+ht_drug_df <- ht_drug_df[, treatment_binary := ifelse(is.na(claim_id), 0, 1)]
+```
+
+#### unique patients (treated vs not)
+```{r}
+unique_patient_with_treatment_binary <- ht_drug_df[!duplicated(patient_id)]
+```
+
+#### Exporting treatment rate data to excel for Tableau plotting 
+```{r}
+unique_patient_with_treatment_binary_file_path <- "~/Documents/Career/astellas-analysis/unique_patient_with_treatment_binary.xlsx"
+write_xlsx(unique_patient_with_treatment_binary, path = unique_patient_with_treatment_binary_file_path)
+```
+
+```{r}
+rm(unique_patient_with_treatment_binary)
+```
+
+
+## Treatment Level data wrangling before inference modeling
+
+#### Creating treatment_rate_df for unique HT patient w/ an indicator for whether or not they've received drugs (treatment_binary)
+```{r}
+treatment_rate_df <- ht_drug_df[,.(patient_id, patient_age, patient_gender, treatment_binary)]
+```
+
+
+#### Treatment level
+#### Creating datatable for those who have received treatment for ht (all claims)
+```{r}
+treatment_level_df <- ht_drug_df[!is.na(claim_id)]
+```
+
+#### Checking cols for observations with NAs
+```{r}
+na_cols <- colSums(is.na(treatment_level_df)) > 0
+print(names(treatment_level_df)[na_cols])
+rm(na_cols)
+```
+
+#### Removing NAs in patient_paid_amount
+```{r}
+treatment_level_df <- treatment_level_df[!is.na(patient_paid_amount)]
+```
+
+#### Removing observations where prescription_days_supply or prescription_quantity = 0
+```{r}
+treatment_level_df <- treatment_level_df[prescription_days_supply!=0 & prescription_quantity!=0]
+```
+
+#### Changing patient_gender to a binary
+```{r}
+treatment_level_df <- treatment_level_df[, patient_gender_female := ifelse(patient_gender=="F",1,0)]
+```
+
+#### Removing rows in diag_df and drug_df where physician specialty is missing
+```{r}
+treatment_level_df <- treatment_level_df[!(physician_specialty == 0 | physician_specialty == "UNKNOWN" | physician_specialty == "")]
+treatment_level_df <- treatment_level_df[!(physician_specialty == 0 | physician_specialty == "UNKNOWN" | physician_specialty == "")]
+```
+
+#### One-hot encoding prescribing physician class
+```{r}
+
+# One-hot encoding the 'drug_brand_name' column
+encoded_physician_class <- model.matrix(~ physician_class - 1, data = treatment_level_df)
+
+# Convert to dataframe
+encoded_physician_class_df <- as.data.frame(encoded_physician_class)
+
+# Combining encoded columns with original data
+treatment_level_df <- cbind(treatment_level_df, encoded_physician_class_df)
+```
+
+#### Reformatting physician class names column names to refect its the number of times they have seen a prescribing physician
+```{r}
+setnames(treatment_level_df, old = "physician_classCardiology", 
+         new = "prescribing_physician_class_is_Cardiology")
+setnames(treatment_level_df, old = "physician_classInternal Medicine", 
+         new = "prescribing_physician_class_is_Internal_Medicine")
+setnames(treatment_level_df, old = "physician_classNon-Physician Practitioners", 
+         new = "prescribing_physician_class_is_Non-Physician_Practitioners", skip_absent = TRUE)
+setnames(treatment_level_df, old = "physician_classNephrology", 
+         new = "prescribing_physician_class_is_Nephrology", skip_absent = TRUE)
+setnames(treatment_level_df, old = "physician_classOther Physician Specialty", 
+         new = "prescribing_physician_class_is_Other_Specialty")
+```
+
+#### Creating ever_prescribed_by  binaries
+```{r}
+phys_columns <- grep("^prescribing_physician_class_", names(treatment_level_df), value = TRUE)
+ever_prescribed_by_df <- treatment_level_df[, lapply(.SD, max), by = patient_id, .SDcols = phys_columns]
+setnames(ever_prescribed_by_df, old = phys_columns, new = paste0("had_", phys_columns))
+treatment_level_df <- merge(treatment_level_df, ever_prescribed_by_df, by = "patient_id", all.x = TRUE)
+
+treatment_level_df[, (phys_columns) := NULL]
+
+```
+
+
+#### Removing Family Medicine column from the One-Hot to avoid multicolinearity (R-1 dummies in total)
+```{r}
+treatment_level_df <- treatment_level_df[,-c("physician_classFamily Medicine", "physician_class")]
+```
+
+
+#### Bucketing drug_brand_names with observations N<5 in final patient cohort
+```{r}
+ht_drugs <- c(
+  "BENICAR", "IRBESARTANE", "AMLODIPINE BESYLATE-BENAZEPRIL", "RAMIPRIL", 
+  "OLMESARTAN MEDOXOMIL", "QUINAPRIL HCL", "TELMISARTAN", "BENAZEPRIL HCL", 
+  "AVAPRO", "BENICAR HCT", "CANDESARTAN-HYDROCHLOROTHIAZID", "EDARBI", 
+  "EDARBYCLOR", "ENALAPRIL-HYDROCHLOROTHIAZIDE"
+)
+
+treatment_level_df[, drug_brand_name := ifelse(drug_brand_name %in% ht_drugs, "other_HT_drug", drug_brand_name)]
+
+```
+
+
+#### One-hot encoding drug brand name
+```{r}
+encoded_drug_brand <- model.matrix(~ drug_brand_name - 1, data = treatment_level_df)
+encoded_drug_brand_df <- as.data.frame(encoded_drug_brand)
+treatment_level_df <- cbind(treatment_level_df, encoded_drug_brand_df)
+```
+
+#### Reformatting brand name One-hot
+```{r}
+setnames(treatment_level_df, old = "drug_brand_nameBENICAR",
+         new = "taken_brand_name_BENICAR", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameAVAPRO",
+         new = "taken_brand_name_AVAPRO", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameAMLODIPINE BESYLATE-BENAZEPRIL",
+         new = "taken_brand_name_AMLODIPINE_BESYLATE_BENAZEPRIL", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameBENAZEPRIL HCL",
+         new = "taken_brand_name_BENAZEPRI_HCL", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameBENICAR",
+         new = "taken_brand_name_BENICAR", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameBENICAR HCT",
+         new = "taken_brand_name_BENICAR_HCT", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameCANDESARTAN-HYDROCHLOROTHIAZID",
+         new = "taken_brand_name_CANDESARTAN_HYDROCHLOROTHIAZID", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameDIOVAN",
+         new = "taken_brand_name_DIOVAN", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameEDARBI",
+         new = "taken_brand_name_EDARBI", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameEDARBYCLOR",
+         new = "taken_brand_name_EDARBYCLOR", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameENALAPRIL MALEATE",
+         new = "taken_brand_name_ENALAPRIL_MALEATE", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameENALAPRIL-HYDROCHLOROTHIAZIDE",
+         new = "taken_brand_name_ENALAPRIL_HYDROCHLOROTHIAZIDE", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameIRBESARTAN",
+         new = "taken_brand_name_IRBESARTANE", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameLISINOPRIL",
+         new = "taken_brand_name_LISINOPRIL", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameLISINOPRIL-HYDROCHLOROTHIAZIDE",
+         new = "taken_brand_name_LISINOPRIL_HYDROCHLOROTHIAZIDE", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameLOSARTAN POTASSIUM",
+         new = "taken_brand_name_LOSARTAN_POTASSIUM", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameLOSARTAN-HYDROCHLOROTHIAZIDE",
+         new = "taken_brand_name_LOSARTAN_HYDROCHLOROTHIAZIDE", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameOLMESARTAN MEDOXOMIL",
+         new = "taken_brand_name_OLMESARTAN_MEDOXOMIL", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameQUINAPRIL HCL",
+         new = "taken_brand_name_QUINAPRIL_HCL", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameRAMIPRIL",
+         new = "taken_brand_name_RAMIPRIL", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameTELMISARTAN",
+         new = "taken_brand_name_TELMISARTAN", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameVALSARTAN",
+         new = "taken_brand_name_VALSARTAN", skip_absent = TRUE)
+setnames(treatment_level_df, old = "drug_brand_nameVALSARTAN-HYDROCHLOROTHIAZIDE",
+         new = "taken_brand_name_VALSARTAN_HYDROCHLOROTHIAZIDE", skip_absent = TRUE)
+setnames(treatment_level_df, old = "other_HT_drugs",
+         new = "taken_other_brand_HT_drugs", skip_absent = TRUE)
+```
+
+#### Removing a LISINOPRIL column from the One-Hot to avoid multicolinearity (R-1 dummies in total); Lis. appears to be most popular on market which is why I'm using it as the baseline drug
+```{r}
+treatment_level_df <- treatment_level_df[,-c("taken_brand_name_LISINOPRIL", "drug_brand_name")]
+```
+
+#### Creating ever_taken drug binaries
+```{r}
+drug_columns <- grep("^taken_brand_name_", names(treatment_level_df), value = TRUE)
+ever_taken_df <- treatment_level_df[, lapply(.SD, max), by = patient_id, .SDcols = drug_columns]
+setnames(ever_taken_df, old = drug_columns, new = paste0("ever_", drug_columns))
+treatment_level_df <- merge(treatment_level_df, ever_taken_df, by = "patient_id", all.x = TRUE)
+
+treatment_level_df[, (drug_columns) := NULL]
+```
+
+#### a. Creating a control: # of days between each patient's first and last script within given timeframe (this will allow us to determine how long they were eligible to recieve drugs)
+```{r}
+treatment_level_df[, days_between_first_last := as.numeric(difftime(max(prescription_filled_date), 
+                                                                  min(prescription_filled_date),
+                                                                  units = "days")),
+                   by = patient_id]
+treatment_level_df$days_between_first_last <- as.numeric(treatment_level_df$days_between_first_last)
+```
+
+#### b: identifying last script received days supply 
+```{r}
+last_script_days_supply <- 
+  treatment_level_df[, .(last_days_supply = prescription_days_supply[which.max(prescription_filled_date)]),
+                                                     by = patient_id]
+
+treatment_level_df <- merge(treatment_level_df, last_script_days_supply, by = "patient_id", all.x = TRUE)
+```
+
+#### c. adding a and b to get total eligible medication window
+```{r}
+treatment_level_df <- treatment_level_df[, eligible_days_to_be_prescribed := .(last_days_supply + days_between_first_last)]
+```
+
+
+#### Creating a treatment level outcome variable: total_days_supply will control for eligibility window (days_between_first_last + last_days_supply)--I want to know based on patient, cost, physician, and drug factors who is consuming the most/least drugs in a given amount of time.
+```{r}
+total_prescription_days_supply <- treatment_level_df[, .(total_days_supply = sum(prescription_days_supply)),
+                                                      by = patient_id]
+treatment_level_df <- merge(treatment_level_df, total_prescription_days_supply, by = "patient_id", all.x = TRUE)
+```
+
+#### Removing unecessary columns from treatment_level_df
+```{r}
+treatment_level_df <- treatment_level_df[,-c("physician_id", "patient_gender", "prescription_filled_date", "prescription_quantity","drug_generic_name", "treatment_binary", "last_days_supply")]
+```
+
+#### Joining # of non-HT comorbid conditions as a control
+```{r}
+treatment_level_df <- merge(treatment_level_df, non_ht_diagnoses_count, on = "patient_id", all.x = TRUE)
+```
+
+#### Creating average of patient paid amount
+```{r}
+treatment_level_df[, average_paid_amount := mean(patient_paid_amount), by = patient_id]
+```
+
+#### Removing unecessary columns from treatment_level_df
+```{r}
+treatment_level_df <- treatment_level_df[,-c("physician_specialty", "prescription_days_supply", "claim_id", "patient_paid_amount", "days_between_first_last")]
+```
+
+#### Removing duplicates
+```{r}
+treatment_level_df <- treatment_level_df[!duplicated(patient_id)]
+```
+
+#### Checking for any missing data
+```{r}
+treatment_level_df[!complete.cases(treatment_level_df), ]
+```
+
+#### Removing patient_id
+```{r}
+treatment_level_df <- treatment_level_df[,-c("patient_id")]
+```
+
+#### tranforming paid amount (skewed)
+```{r}
+treatment_level_df <- treatment_level_df[,"sqrt_average_paid_amount" := sqrt(average_paid_amount)]
+```
+
+#### Removing drug binaries from treatment_level_df with only 1 observation
+```{r}
+treatment_level_df <- treatment_level_df[,-c("average_paid_amount")]
+```
+
+
+
+## Statistical Analysis: Part 1
+### Treatment/(Medication Consumption) Level on patient, drug, and physician features. Again, I want to know based on patient, cost, physician, and drug features who is consuming the most/least drugs in a given amount of time, measured in total days supply
+
+#### OLS on patient & physician features
+```{r}
+OLS.fit.1 <- lm(total_days_supply ~ 
+                             log(patient_age) +
+                             patient_gender_female +
+                             sqrt_average_paid_amount +
+                             had_prescribing_physician_class_is_Cardiology +
+                             had_prescribing_physician_class_is_Internal_Medicine +
+                             had_prescribing_physician_class_is_Other_Specialty +
+                             eligible_days_to_be_prescribed + non_ht_count, 
+                           data = treatment_level_df)
+```
+
+```{r}
+summary(OLS.fit.1)
+```
+
+#### LASSO Treatment level/Medication consumption on patient & physician features
+```{r}
+X <- as.matrix(treatment_level_df[, c("patient_age",
+                             "patient_gender_female",
+                             "sqrt_average_paid_amount",
+                             "had_prescribing_physician_class_is_Cardiology", 
+                             "had_prescribing_physician_class_is_Internal_Medicine", 
+                             "had_prescribing_physician_class_is_Other_Specialty",
+                             "eligible_days_to_be_prescribed",
+                             "non_ht_count")])
+y <- treatment_level_df$total_days_supply
+
+lasso_1 <- cv.glmnet(x = X, y = y, alpha = 1)
+coef(lasso_1)
+```
+
+#### OLS Treatment level/Medication Consumption on drug features
+```{r}
+OLS.fit.2 <- lm(total_days_supply ~ . - patient_age - + log(patient_age),
+                           data = treatment_level_df)
+```
+
+```{r}
+summary(OLS.fit.2)
+```
+
+#### LASSO Treatment level/Medication consumption on drug features
+```{r}
+X <- as.matrix(treatment_level_df[, -c("patient_age",
+                             "patient_gender_female",
+                             "had_prescribing_physician_class_is_Cardiology", 
+                             "had_prescribing_physician_class_is_Internal_Medicine",
+                             "prescribing_physician_class_is_Other_Specialty",
+                             "non_ht_count", "total_days_supply")])
+y <- treatment_level_df$total_days_supply
+
+lasso_2 <- cv.glmnet(x = X, y = y, alpha = 1)
+coef(lasso_2)
+```
+
+
+
+## Treatment Level data wrangling before inference modeling
+
+#### Merging patient_df with diagnosing physician class data from ht_df (this provides all physician classes who made an HT diagnosis for each patient)
+```{r}
+setkey(ht_df, patient_id)
+setkey(patient_df, patient_id)
+
+ht_df[, patient_id := as.integer64(patient_id)]
+
+patient_df2 <- merge(patient_df, ht_df[, c("patient_id", "physician_class"), with = FALSE], by = "patient_id", all.x = FALSE, all.y = TRUE)
+```
+
+### One-hot encoding prescribing physician class
+```{r}
+
+# One-hot encode the 'drug_brand_name' column
+encoded_physician_class <- model.matrix(~ physician_class - 1, data = patient_df2)
+
+# Convert the encoded matrix to a data.frame
+encoded_physician_class_df <- as.data.frame(encoded_physician_class)
+
+# Combine the encoded columns with the original data
+patient_df2 <- cbind(patient_df2, encoded_physician_class_df)
+```
+
+### Reformatting physician class names
+```{r}
+setnames(patient_df2, old = "physician_classFamily Medicine", 
+         new = "physician_classFamily_Medicine", skip_absent = TRUE)
+setnames(patient_df2, old = "physician_classInternal Medicine", 
+         new = "physician_classInternal_Medicine", skip_absent = TRUE)
+setnames(patient_df2, old = "physician_classNon-Physician Practitioners", 
+         new = "physician_classNon_Physician_Practitioners")
+```
+
+### dropping other avoid multicolinerity (R-1) dummies
+```{r}
+patient_df2 <- patient_df2[, -c("physician_classFamily_Medicine")]
+```
+
+### I want to understand the relationship between diagnosing physician class/specialty and if a patient later receives treatment for HT. Creating "ever_seen by physician class" binaries (from claim-level binaries). The below code will indicate whether or not a patient has been ever diagnosed with HT by each relevant physician class over the observed period. Unfortunately, due to the way medical records are coded, it does not make sense to count this data. For example, a patient admitted to the hospital may receive a HT diagnosis multiple times during a single stay. This may lead to overcounting if we simply count number of diagnoses by physician class. 
+```{r}
+physician_classes <- c("physician_classCardiology", 
+                       "physician_classOther Physician Specialty",
+                        "physician_classInternal_Medicine",
+                        "physician_classNephrology",
+                        "physician_classNon_Physician_Practitioners")
+
+patient_physician_classes <- patient_df2[, c("patient_id", physician_classes), with = FALSE]
+
+# Creating new binary columns for each physician class indicating whether the patient has ever seen each class
+for (class in physician_classes) {
+  binary_col_name <- paste0("ever_diagnosed_by", sub("physician_class", "", class))
+  patient_df2[[binary_col_name]] <- ifelse(patient_df2$patient_id %in% patient_physician_classes$patient_id[patient_physician_classes[[class]] == 1], 1, 0)
+}
+```
+
+#### merging count of comorbid non-HT diagnoses for each patient
+```{r}
+patient_df2 <- merge(patient_df2, non_ht_diagnoses_count, by = "patient_id", all.x = TRUE)
+```
+
+
+
+
+#### merging on the outcome variable which is treatment_binary (those who received HT medication)
+```{r}
+setkey(treatment_rate_df, patient_id)
+setkey(treatment_rate_df, patient_id)
+setkey(patient_df, patient_id)
+
+treatment_rate_df[, patient_id := as.integer64(patient_id)]
+treatment_rate_df <- treatment_rate_df[!duplicated(patient_id)]
+
+# Merge the data tables
+patient_df2 <- merge(patient_df2, treatment_rate_df[, c("patient_id", "treatment_binary"), with = FALSE], by = "patient_id", all.x = TRUE)
+```
+
+### Changing patient_gender to a binary
+```{r}
+patient_df2 <- patient_df2[, patient_gender_female := ifelse(patient_gender=="F",1,0)]
+```
+
+#### Removing unecessary columns from table
+```{r}
+patient_df2 <- patient_df2[,-c("physician_class", "patient_gender", "HT_diagosis_physician_class", "physician_classCardiology", "physician_classOther Physician Specialty", "physician_classInternal_Medicine", "physician_classNephrology", "physician_classNon_Physician_Practitioners")]
+```
+
+```{r}
+patient_df2 <- patient_df2[!duplicated(patient_id)]
+```
+
+```{r}
+patient_df2 <- patient_df2[, "log(patient_age)" := log(patient_age)]
+```
+
+
+
+## Statistical Analysis: Part 2
+### Treatment Rate based on diagnosis patient, physician features
+
+```{r}
+logreg.treatment_rate.1 <- glm(treatment_binary ~.-patient_id -patient_age , family = "binomial", data = patient_df2)
+summary(logreg.treatment_rate.1)
+```
+
+
+## Statistical Analysis: Part 3 Additional prelimary analyses I did before regression modeling
+
+### Chi-square Treatment Rate
+
+#### Likelihood of being treated with drugs based on gender (chi-sqaure)
+```{r}
+gender_treatment_chi_table <- table(patient_df2$treatment_binary, patient_df2$patient_gender_female)
+gender_treatment_chi_test <- chisq.test(gender_treatment_chi_table)
+print(gender_treatment_chi_test)
+```
+#### Likelihood of being treated with drugs based on physician classes (chi-sqaure)
+
+##### Cardiology
+```{r}
+cardiology_chi_table <- table(patient_df2$ever_diagnosed_byCardiology, patient_df2$treatment_binary)
+cardiology_treatment_chi_test <- chisq.test(cardiology_chi_table)
+print(cardiology_chi_table)
+```
+```{r}
+# Create the contingency table
+cardiology_chi_table <- table(patient_df2$ever_diagnosed_byCardiology, patient_df2$treatment_binary)
+
+# Calculate the row percentages
+cardiology_perc_table <- prop.table(cardiology_chi_table, margin = 1) * 100
+
+# Perform chi-squared test
+cardiology_treatment_chi_test <- chisq.test(cardiology_chi_table)
+
+# Print the contingency table with counts
+print(cardiology_chi_table)
+
+# Print the contingency table with percentages
+print(round(cardiology_perc_table, 2))
+
+# Print the chi-squared test result
+print(cardiology_treatment_chi_test)
+```
+
+
+
+
+
+##### Internal Medicine
+```{r}
+IM_treatment_chi_table <- table(patient_df2$treatment_binary, patient_df2$ever_diagnosed_byInternal_Medicine)
+IM_treatment_chi_test <- chisq.test(IM_treatment_chi_table)
+print(IM_treatment_chi_test)
+```
+##### Nephrology
+```{r}
+Neph_treatment_chi_table <- table(patient_df2$ever_diagnosed_byNephrology, patient_df2$treatment_binary)
+Neph_treatment_chi_test <- chisq.test(Neph_treatment_chi_table)
+print(Neph_treatment_chi_table)
+```
+```{r}
+# Create the contingency table
+nephrology_chi_table <- table(patient_df2$ever_diagnosed_byNephrology, patient_df2$treatment_binary)
+
+# Calculate the row percentages
+nephrology_perc_table <- prop.table(nephrology_chi_table, margin = 1) * 100
+
+# Perform chi-squared test
+nephrology_treatment_chi_test <- chisq.test(nephrology_chi_table)
+
+# Print the contingency table with counts
+print(nephrology_chi_table)
+
+# Print the contingency table with percentages
+print(round(nephrology_perc_table, 2))
+
+# Print the chi-squared test result
+print(nephrology_treatment_chi_test)
+```
+
+
+
+
+
+##### Other Specialty
+```{r}
+OS_treatment_chi_table <- table(patient_df2$treatment_binary, patient_df2$`ever_diagnosed_byOther Physician Specialty`)
+OS_treatment_chi_test <- chisq.test(OS_treatment_chi_table)
+print(OS_treatment_chi_test)
+```
+##### Non-Physician Practitioners
+```{r}
+NonPhys_treatment_chi_table <- table(patient_df2$treatment_binary, patient_df2$ever_diagnosed_byNon_Physician_Practitioners)
+NonPhys_treatment_chi_test <- chisq.test(NonPhys_treatment_chi_table)
+print(NonPhys_treatment_chi_test)
+```
+
+```{r}
+library(writexl)
+treatment_likelihood_file_path <- "~/Documents/Career/astellas-analysis/treatment_likelihood.xlsx"
+treatment_level_file_path <- "~/Documents/Career/astellas-analysis/treatment_level.xlsx"
+
+write_xlsx(patient_df2[,-c("patient_id")], path = treatment_level_file_path)
+```
+
+
+#### checking N observations for binaries in treatment_level_df
+```{r}
+treatment_level_dfcolumn_sums <- treatment_level_df[, lapply(.SD, sum, na.rm = TRUE)]
+
+treatment_level_df_colsums_df <- data.table(column_name = names(treatment_level_dfcolumn_sums), sum_of_values = as.numeric(treatment_level_dfcolumn_sums))
+```
+
+#### checking N observations for binaries in patientdf2
+```{r}
+patientdf2_column_sums <- patient_df2[, lapply(.SD, sum, na.rm = TRUE)]
+
+patientdf2_column_sums_df <- data.table(column_name = names(patientdf2_column_sums), sum_of_values = as.integer(patientdf2_column_sums))
+```
+
+
+## Drug Prices (Treatment duration)
+#### seeing what is the most common days supply across drugs (its 30)
+```{r}
+drug_days_supply_counts <- drug_df[, .N, by = .(prescription_days_supply)]
+```
+
+####checking if there are any drugs that do not have a 30 day supply
+```{r}
+drug_30_days_supply_df <- drug_df[prescription_days_supply==30]
+drug_30_days_supply_df <- drug_df[!is.na(patient_paid_amount)]
+average_paid_amount_30_days <- drug_30_days_supply_df[, .(average_paid_amount = mean(patient_paid_amount)), by = drug_brand_name]
+```
+#### removing drugs with NAs in paid amount 
+```{r}
+drug_30_days_supply_df <- drug_30_days_supply_df[!is.na(patient_paid_amount)]
+unique(drug_30_days_supply_df$drug_brand_name)
+```
+```{r}
+# Count the number of observations for each drug_brand_name
+drug_30_day_supply_counts <- drug_30_days_supply_df[, .N, by = drug_brand_name]
+
+# Identify the top 5 drug_brand_names by count
+top_drugs_brands <- drug_30_day_supply_counts[order(-N)][1:10, drug_brand_name]
+
+# Filter the original data.table
+top_10_drug_30_days_supply_df <- drug_30_days_supply_df[drug_brand_name %in% top_drugs_brands]
+```
+
+```{r}
+#creating a log of patient_paid_amount
+top_10_drug_30_days_supply_df <- top_10_drug_30_days_supply_df[, "log(patient_paid_amount)" := log(patient_paid_amount)]
+
+```
+
+
+```{r}
+count_by_brand <- drug_df[, .(count = .N), by = drug_brand_name][order(-count)]
+
+```
+
+
+
+```{r}
+
+# Load the necessary libraries
+library(ggplot2)
+
+# Example code to add a regression line to each facet plot
+ggplot(counts, aes(x = log(N), y = log(patient_paid_amount), group = drug_brand_name)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Add regression line without confidence interval
+  facet_wrap(~ drug_brand_name, scales = "free") +  # Allow free scales for both axes
+  labs(title = "Patient Paid Amount by Number of Observations",
+       x = "Number of Observations",
+       y = "Patient Paid Amount") +
+  theme_minimal() +
+  theme(legend.position = "none")  # Remove the legend
+
+
+
+```
+
+```{r}
+# Plot the data
+ggplot(top_10_drug_30_days_supply_df, aes(x = log(patient_paid_amount))) +
+  geom_point(binwidth = 1, fill = "blue", color = "black") +
+  facet_wrap(~ drug_brand_name, scales = "free") +  # Allow free scales for both axes
+  labs(title = "Histogram of Patient Paid Amount by Drug Brand Name",
+       x = "Patient Paid Amount",
+       y = "Frequency") +
+  theme_minimal()
+
+```
+
+```{r}
+# Calculate the sum of counts for all drug brand names
+total_count <- sum(count_by_brand$count)
+
+# Calculate the sum of counts for the top 5 drug brand names
+top5_count <- sum(count_by_brand$count[1:5])
+
+# Calculate the ratio
+ratio <-  top5_count/total_count
+
+# View the result
+print(ratio)
+
+```
+
+
+```{r}
+library(writexl)
+treatment_level_file_path <- "~/Documents/Career/astellas-analysis/treatment_level.xlsx"
+
+write_xlsx(treatment_level_df, path = treatment_level_file_path)
+```
+
+
+```{r}
+```
+
+
+```{r}
+mean(treatment_level_df$total_days_supply)
+```
+
+
